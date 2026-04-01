@@ -1,29 +1,107 @@
-import 'dotenv/config'; 
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import mongoose from 'mongoose';
-import Transbank from 'transbank-sdk'; 
+import Transbank from 'transbank-sdk';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import nodemailer from 'nodemailer'; 
+import nodemailer from 'nodemailer';
+
+// --- SEGURIDAD ---
+import { rateLimit } from 'express-rate-limit';
+import helmet from 'helmet';
+import xss from 'xss-clean';
+import mongoSanitize from 'express-mongo-sanitize';
 
 // Importamos los modelos
 import { Order } from './models/Order.js';
 import { User } from './models/User.js';
-import { Product } from './models/Product.js'; 
-import { Coupon } from './models/Coupons.js'; // <--- CORREGIDO: Importamos 'Coupon' (Singular) del archivo 'Coupons.js'
+import { Product } from './models/Product.js';
+import { Coupon } from './models/Coupons.js';
 
 const { WebpayPlus, Options, IntegrationApiKeys, IntegrationCommerceCodes, Environment } = Transbank;
 
 const app = express();
 const port = process.env.PORT || 5000;
-const SECRET_KEY = process.env.JWT_SECRET; 
+const SECRET_KEY = process.env.JWT_SECRET;
 
-// --- CONFIGURACIÓN ---
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true })); 
+// --- VARIABLES DE ENTORNO PARA DESPLIEGUE ---
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000';
 
+// ==========================================
+//  CONFIGURACIÓN DE SEGURIDAD GLOBAL 🛡️
+// ==========================================
+
+app.use(helmet());
+app.use(mongoSanitize()); // Previene NoSQL Injection
+app.use(xss());           // Limpia scripts maliciosos (XSS)
+
+// ✅ CORS restringido al frontend autorizado
+app.use(cors({
+  origin: FRONTEND_URL,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+
+// ✅ Rate limit general: 100 peticiones cada 15 minutos
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Demasiadas peticiones. Intenta más tarde.' }
+});
+app.use('/api/', limiter);
+
+// ✅ Rate limit estricto solo para login: 10 intentos cada 15 minutos
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Demasiados intentos de inicio de sesión. Intenta más tarde.' }
+});
+
+// ✅ Rate limit para validación de cupones: 20 intentos cada 15 minutos
+const couponLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Demasiados intentos de validación. Intenta más tarde.' }
+});
+
+// ==========================================
+//  MIDDLEWARES DE AUTORIZACIÓN 🔐
+// ==========================================
+
+const verifyToken = (req, res, next) => {
+  const token = req.headers['authorization']?.split(' ')[1];
+  if (!token) return res.status(403).json({ error: "No se proporcionó un token de acceso." });
+
+  jwt.verify(token, SECRET_KEY, (err, decoded) => {
+    if (err) return res.status(401).json({ error: "Sesión inválida o expirada." });
+    req.user = decoded;
+    next();
+  });
+};
+
+const isAdmin = (req, res, next) => {
+  verifyToken(req, res, () => {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Acceso denegado: Se requiere rol de administrador." });
+    }
+    next();
+  });
+};
+
+// ==========================================
+//  CONEXIÓN BASE DE DATOS
+// ==========================================
 mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/doggyeats')
   .then(() => console.log('🍃 MongoDB Conectado Exitosamente'))
   .catch(err => console.error('❌ Error al conectar MongoDB:', err));
@@ -37,78 +115,9 @@ const transporter = nodemailer.createTransport({
 });
 
 // ==========================================
-//  RUTAS DE CUPONES (CLIENTE + ADMIN) 🎟️
+//  AUTENTICACIÓN
 // ==========================================
 
-// 1. VALIDAR CUPÓN (Para el Carrito del Cliente)
-app.post('/api/coupons/validate', async (req, res) => {
-  try {
-    const { code, userEmail } = req.body;
-    // Usamos 'Coupon' en singular porque así se llama la variable del modelo
-    const coupon = await Coupon.findOne({ code: code.toUpperCase() });
-    
-    if (!coupon) return res.status(404).json({ error: "Cupón no existe" });
-    if (!coupon.isActive) return res.status(400).json({ error: "Cupón inactivo" });
-    
-    if (coupon.usedBy.includes(userEmail)) {
-      return res.status(400).json({ error: "Ya utilizaste este cupón anteriormente" });
-    }
-
-    res.json({ 
-      message: "Cupón aplicado", 
-      discountPercent: coupon.discountPercent, 
-      code: coupon.code 
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Error al validar cupón" });
-  }
-});
-
-// 2. CREAR UN NUEVO CUPÓN (Para el Panel Admin)
-app.post('/api/coupons', async (req, res) => {
-  try {
-    const { code, discountPercent, expirationDate } = req.body;
-    
-    const existing = await Coupon.findOne({ code: code.toUpperCase() });
-    if (existing) return res.status(400).json({ error: "Este código ya existe" });
-
-    const newCoupon = new Coupon({ 
-      code: code.toUpperCase(), 
-      discountPercent, 
-      expirationDate,
-      usedBy: [] 
-    });
-    
-    await newCoupon.save();
-    res.json(newCoupon);
-  } catch (error) {
-    res.status(500).json({ error: "Error al crear cupón" });
-  }
-});
-
-// 3. OBTENER TODOS LOS CUPONES (Para el Panel Admin)
-app.get('/api/coupons', async (req, res) => {
-  try {
-    const coupons = await Coupon.find().sort({ createdAt: -1 });
-    res.json(coupons);
-  } catch (error) {
-    res.status(500).json({ error: "Error al obtener cupones" });
-  }
-});
-
-// 4. ELIMINAR CUPÓN (Para el Panel Admin)
-app.delete('/api/coupons/:id', async (req, res) => {
-  try {
-    await Coupon.findByIdAndDelete(req.params.id);
-    res.json({ message: "Cupón eliminado" });
-  } catch (error) {
-    res.status(500).json({ error: "Error al eliminar cupón" });
-  }
-});
-
-// ==========================================
-//  RUTAS DE AUTENTICACIÓN
-// ==========================================
 app.post('/api/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
@@ -119,12 +128,11 @@ app.post('/api/register', async (req, res) => {
     const newUser = new User({ name, email, password: hashedPassword });
     await newUser.save();
     res.status(201).json({ message: "Usuario creado con éxito" });
-  } catch (error) {
-    res.status(500).json({ error: "Error al registrar usuario" });
-  }
+  } catch (error) { res.status(500).json({ error: "Error al registrar usuario" }); }
 });
 
-app.post('/api/login', async (req, res) => {
+// ✅ Rate limit específico para login
+app.post('/api/login', loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     const user = await User.findOne({ email });
@@ -134,35 +142,44 @@ app.post('/api/login', async (req, res) => {
     if (!isMatch) return res.status(400).json({ error: "Contraseña incorrecta" });
 
     const token = jwt.sign({ id: user._id, role: user.role }, SECRET_KEY, { expiresIn: '1h' });
-    
     res.json({ token, user: { name: user.name, email: user.email, role: user.role } });
-  } catch (error) {
-    res.status(500).json({ error: "Error al iniciar sesión" });
-  }
+  } catch (error) { res.status(500).json({ error: "Error al iniciar sesión" }); }
 });
 
 // ==========================================
-//  RUTAS DE PERFIL
+//  PERFIL DE USUARIO 🔐 (protegido)
 // ==========================================
-app.get('/api/user/:email', async (req, res) => {
+
+// ✅ Protegido: solo el usuario autenticado puede ver su perfil
+app.get('/api/user/:email', verifyToken, async (req, res) => {
   try {
+    // ✅ El usuario solo puede ver su propio perfil, no el de otros
+    if (req.user.role !== 'admin' && req.user.email !== req.params.email) {
+      return res.status(403).json({ error: "Acceso denegado." });
+    }
     const user = await User.findOne({ email: req.params.email });
     if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
     res.json({ name: user.name, email: user.email, myPet: user.myPet, savedAddress: user.savedAddress });
   } catch (error) { res.status(500).json({ error: "Error al obtener perfil" }); }
 });
 
-app.put('/api/user/update', async (req, res) => {
+// ✅ Protegido: solo el usuario autenticado puede editar su perfil
+app.put('/api/user/update', verifyToken, async (req, res) => {
   try {
     const { email, myPet, savedAddress } = req.body;
+    // ✅ El usuario solo puede editar su propio perfil
+    if (req.user.role !== 'admin' && req.user.email !== email) {
+      return res.status(403).json({ error: "Acceso denegado." });
+    }
     await User.findOneAndUpdate({ email }, { myPet, savedAddress });
     res.json({ message: "Perfil actualizado correctamente" });
   } catch (error) { res.status(500).json({ error: "Error al actualizar perfil" }); }
 });
 
 // ==========================================
-//  RUTAS DE NEWSLETTER
+//  NEWSLETTER
 // ==========================================
+
 app.post('/api/subscribe', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "Falta el email" });
@@ -202,8 +219,53 @@ app.post('/api/subscribe', async (req, res) => {
 });
 
 // ==========================================
-//  RUTAS DE PRODUCTOS
+//  CUPONES 🎟️
 // ==========================================
+
+// ✅ Rate limit específico para evitar enumeración de cupones
+app.post('/api/coupons/validate', couponLimiter, async (req, res) => {
+  try {
+    const { code, userEmail } = req.body;
+    const coupon = await Coupon.findOne({ code: code.toUpperCase() });
+    if (!coupon) return res.status(404).json({ error: "Cupón no existe" });
+    if (!coupon.isActive) return res.status(400).json({ error: "Cupón inactivo" });
+    if (coupon.usedBy.includes(userEmail)) return res.status(400).json({ error: "Ya utilizaste este cupón" });
+
+    res.json({ message: "Cupón aplicado", discountPercent: coupon.discountPercent, code: coupon.code });
+  } catch (error) { res.status(500).json({ error: "Error al validar cupón" }); }
+});
+
+// Rutas de administración de cupones — protegidas con isAdmin
+app.post('/api/coupons', isAdmin, async (req, res) => {
+  try {
+    const { code, discountPercent, expirationDate } = req.body;
+    const existing = await Coupon.findOne({ code: code.toUpperCase() });
+    if (existing) return res.status(400).json({ error: "Este código ya existe" });
+
+    const newCoupon = new Coupon({ code: code.toUpperCase(), discountPercent, expirationDate, usedBy: [] });
+    await newCoupon.save();
+    res.json(newCoupon);
+  } catch (error) { res.status(500).json({ error: "Error al crear cupón" }); }
+});
+
+app.get('/api/coupons', isAdmin, async (req, res) => {
+  try {
+    const coupons = await Coupon.find().sort({ createdAt: -1 });
+    res.json(coupons);
+  } catch (error) { res.status(500).json({ error: "Error al obtener cupones" }); }
+});
+
+app.delete('/api/coupons/:id', isAdmin, async (req, res) => {
+  try {
+    await Coupon.findByIdAndDelete(req.params.id);
+    res.json({ message: "Cupón eliminado" });
+  } catch (error) { res.status(500).json({ error: "Error al eliminar cupón" }); }
+});
+
+// ==========================================
+//  PRODUCTOS
+// ==========================================
+
 app.get('/api/products', async (req, res) => {
   try {
     const products = await Product.find();
@@ -222,9 +284,7 @@ app.get('/api/products/search/:query', async (req, res) => {
       ]
     });
     res.json(products);
-  } catch (error) {
-    res.status(500).json({ error: "Error en la búsqueda" });
-  }
+  } catch (error) { res.status(500).json({ error: "Error en la búsqueda" }); }
 });
 
 app.get('/api/products/:id', async (req, res) => {
@@ -235,7 +295,8 @@ app.get('/api/products/:id', async (req, res) => {
   } catch (error) { res.status(500).json({ error: "Error al buscar producto" }); }
 });
 
-app.post('/api/products', async (req, res) => {
+// ✅ Protegido con isAdmin
+app.post('/api/products', isAdmin, async (req, res) => {
   try {
     const newProduct = new Product(req.body);
     await newProduct.save();
@@ -244,7 +305,8 @@ app.post('/api/products', async (req, res) => {
   } catch (error) { res.status(500).json({ error: "Error al crear producto" }); }
 });
 
-app.post('/api/products/:id/review', async (req, res) => {
+// ✅ Reseñas: solo usuarios autenticados pueden dejar una
+app.post('/api/products/:id/review', verifyToken, async (req, res) => {
   try {
     const { user, rating, comment } = req.body;
     const product = await Product.findById(req.params.id);
@@ -252,15 +314,13 @@ app.post('/api/products/:id/review', async (req, res) => {
 
     const newReview = { user, rating: Number(rating), comment };
     product.reviews.push(newReview);
-    
     await product.save();
-    res.json(product); 
-  } catch (error) {
-    res.status(500).json({ error: "Error al guardar reseña" });
-  }
+    res.json(product);
+  } catch (error) { res.status(500).json({ error: "Error al guardar reseña" }); }
 });
 
-app.delete('/api/products/:id', async (req, res) => {
+// ✅ Protegido con isAdmin
+app.delete('/api/products/:id', isAdmin, async (req, res) => {
   try {
     await Product.findByIdAndDelete(req.params.id);
     console.log("🗑️ Producto eliminado:", req.params.id);
@@ -268,25 +328,24 @@ app.delete('/api/products/:id', async (req, res) => {
   } catch (error) { res.status(500).json({ error: "Error al eliminar producto" }); }
 });
 
-app.delete('/api/products/:productId/reviews/:reviewId', async (req, res) => {
+// ✅ Protegido con isAdmin
+app.delete('/api/products/:productId/reviews/:reviewId', isAdmin, async (req, res) => {
   try {
     const { productId, reviewId } = req.params;
     const updatedProduct = await Product.findByIdAndUpdate(
       productId,
-      { $pull: { reviews: { _id: reviewId } } }, 
-      { new: true } 
+      { $pull: { reviews: { _id: reviewId } } },
+      { new: true }
     );
     res.json(updatedProduct);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Error al eliminar la reseña" });
-  }
+  } catch (error) { res.status(500).json({ error: "Error al eliminar la reseña" }); }
 });
 
 // ==========================================
-//  RUTA DASHBOARD (ESTADÍSTICAS)
+//  DASHBOARD 🔐 (solo admin)
 // ==========================================
-app.get('/api/dashboard/stats', async (req, res) => {
+
+app.get('/api/dashboard/stats', isAdmin, async (req, res) => {
   try {
     const productCount = await Product.countDocuments();
     const validStatuses = ['PAID', 'PREPARING', 'SHIPPED', 'DELIVERED', 'COMPLETED'];
@@ -297,48 +356,48 @@ app.get('/api/dashboard/stats', async (req, res) => {
 
     const salesMap = {};
     orders.forEach(order => {
-        const date = new Date(order.createdAt).toLocaleDateString('es-CL', { day: '2-digit', month: '2-digit' });
-        salesMap[date] = (salesMap[date] || 0) + order.amount;
+      const date = new Date(order.createdAt).toLocaleDateString('es-CL', { day: '2-digit', month: '2-digit' });
+      salesMap[date] = (salesMap[date] || 0) + order.amount;
     });
 
-    const chartData = Object.keys(salesMap).map(date => ({
-        name: date,
-        ventas: salesMap[date]
-    })).slice(-7); 
-
+    const chartData = Object.keys(salesMap).map(date => ({ name: date, ventas: salesMap[date] })).slice(-7);
     res.json({ totalSales, totalOrders, productCount, chartData });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Error obteniendo estadísticas" });
-  }
+  } catch (error) { res.status(500).json({ error: "Error obteniendo estadísticas" }); }
 });
 
 // ==========================================
-//  RUTAS DE PEDIDOS Y PAGOS
+//  ÓRDENES 🔐 (protegidas)
 // ==========================================
-app.get('/api/orders/:email', async (req, res) => {
+
+// ✅ El usuario solo puede ver sus propias órdenes
+app.get('/api/orders/:email', verifyToken, async (req, res) => {
   try {
-    const { email } = req.params;
-    const orders = await Order.find({ userEmail: email }).sort({ createdAt: -1 });
+    if (req.user.role !== 'admin' && req.user.email !== req.params.email) {
+      return res.status(403).json({ error: "Acceso denegado." });
+    }
+    const orders = await Order.find({ userEmail: req.params.email }).sort({ createdAt: -1 });
     res.json(orders);
   } catch (error) { res.status(500).json({ error: "Error al obtener órdenes" }); }
 });
 
-app.get('/api/all-orders', async (req, res) => {
+// ✅ Solo admin puede ver todas las órdenes
+app.get('/api/all-orders', isAdmin, async (req, res) => {
   try {
     const orders = await Order.find().sort({ createdAt: -1 });
     res.json(orders);
   } catch (error) { res.status(500).json({ error: "Error al obtener todas las órdenes" }); }
 });
 
-app.delete('/api/orders/:id', async (req, res) => {
+// ✅ Solo admin puede eliminar órdenes
+app.delete('/api/orders/:id', isAdmin, async (req, res) => {
   try {
     await Order.findByIdAndDelete(req.params.id);
     res.json({ message: "Orden eliminada correctamente" });
   } catch (error) { res.status(500).json({ error: "Error al eliminar la orden" }); }
 });
 
-app.put('/api/orders/:id/status', async (req, res) => {
+// ✅ Solo admin puede cambiar el estado de una orden
+app.put('/api/orders/:id/status', isAdmin, async (req, res) => {
   try {
     const { status } = req.body;
     const updatedOrder = await Order.findByIdAndUpdate(req.params.id, { status }, { new: true });
@@ -346,83 +405,71 @@ app.put('/api/orders/:id/status', async (req, res) => {
   } catch (error) { res.status(500).json({ error: "Error al actualizar estado" }); }
 });
 
-// -----------------------------------------------------------------
-// TRANSBANK: CREAR TRANSACCIÓN (Con lógica de Cupón) 🎟️
-// -----------------------------------------------------------------
+// ==========================================
+//  TRANSBANK
+// ==========================================
+
 app.post('/api/create-transaction', async (req, res) => {
   try {
-    // 1. Recibimos couponCode (si existe) desde el frontend
-    const { amount, shipping, items, userEmail, couponCode } = req.body; 
-    
-    const buyOrder = "O-" + Date.now(); 
+    const { amount, shipping, items, userEmail, couponCode } = req.body;
+    const buyOrder = "O-" + Date.now();
     const sessionId = "S-" + Date.now();
-    
-    // 2. Guardamos la orden con el cupón en estado "pendiente"
-    const newOrder = new Order({ 
-        buyOrder, 
-        sessionId, 
-        amount, 
-        shipping, 
-        items, 
-        userEmail,
-        couponUsed: couponCode || null // <--- GUARDAMOS EL INTENTO DE USO
+
+    const newOrder = new Order({
+      buyOrder, sessionId, amount, shipping, items, userEmail,
+      couponUsed: couponCode || null
     });
-    
     await newOrder.save();
-    
-    const returnUrl = "http://localhost:5000/api/commit";
-    const createResponse = await (new WebpayPlus.Transaction(new Options(IntegrationCommerceCodes.WEBPAY_PLUS, IntegrationApiKeys.WEBPAY, Environment.Integration))).create(buyOrder, sessionId, amount, returnUrl);
-    
+
+    const returnUrl = `${BACKEND_URL}/api/commit`;
+    const createResponse = await (new WebpayPlus.Transaction(
+      new Options(IntegrationCommerceCodes.WEBPAY_PLUS, IntegrationApiKeys.WEBPAY, Environment.Integration)
+    )).create(buyOrder, sessionId, amount, returnUrl);
+
     res.json({ token: createResponse.token, url: createResponse.url });
   } catch (error) { res.status(500).json({ error: "Error al iniciar pago" }); }
 });
 
-// -----------------------------------------------------------------
-// TRANSBANK: CONFIRMAR TRANSACCIÓN (Y quemar cupón) 🔥
-// -----------------------------------------------------------------
 app.use('/api/commit', async (req, res) => {
   try {
     const token = req.body?.token_ws || req.query?.token_ws;
-    if (!token) return res.redirect('http://localhost:5173/cart?status=cancelled');
+    if (!token) return res.redirect(`${FRONTEND_URL}/cart?status=cancelled`);
 
-    const commitResponse = await (new WebpayPlus.Transaction(new Options(IntegrationCommerceCodes.WEBPAY_PLUS, IntegrationApiKeys.WEBPAY, Environment.Integration))).commit(token);
+    const commitResponse = await (new WebpayPlus.Transaction(
+      new Options(IntegrationCommerceCodes.WEBPAY_PLUS, IntegrationApiKeys.WEBPAY, Environment.Integration)
+    )).commit(token);
 
     if (commitResponse.status === 'AUTHORIZED') {
       const order = await Order.findOneAndUpdate(
-        { buyOrder: commitResponse.buy_order }, 
-        { status: 'PAID' }, 
+        { buyOrder: commitResponse.buy_order },
+        { status: 'PAID' },
         { new: true }
       );
-
       if (order) {
-        // 1. Descontar Stock de Productos
         for (const item of order.items) {
           await Product.findByIdAndUpdate(item.id, { $inc: { stock: -item.quantity } });
         }
-
-        // 2. QUEMAR EL CUPÓN (Si se usó)
         if (order.couponUsed) {
-            await Coupon.findOneAndUpdate(
-                { code: order.couponUsed },
-                { $push: { usedBy: order.userEmail } } // <--- AGREGAMOS AL USUARIO A LA LISTA
-            );
-            console.log(`🎫 Cupón ${order.couponUsed} marcado como usado por ${order.userEmail}`);
+          await Coupon.findOneAndUpdate(
+            { code: order.couponUsed },
+            { $push: { usedBy: order.userEmail } }
+          );
+          console.log(`🎫 Cupón ${order.couponUsed} marcado como usado por ${order.userEmail}`);
         }
-        
         console.log(`✅ Orden pagada: ${order.buyOrder}`);
       }
-      res.redirect(`http://localhost:5173/success?amount=${commitResponse.amount}&order=${commitResponse.buy_order}`);
+      res.redirect(`${FRONTEND_URL}/success?amount=${commitResponse.amount}&order=${commitResponse.buy_order}`);
     } else {
       await Order.findOneAndUpdate({ buyOrder: commitResponse.buy_order }, { status: 'REJECTED' });
-      res.redirect('http://localhost:5173/cart?status=rejected');
+      res.redirect(`${FRONTEND_URL}/cart?status=rejected`);
     }
-  } catch (error) { 
+  } catch (error) {
     console.error(error);
-    res.redirect('http://localhost:5173/cart?status=error'); 
+    res.redirect(`${FRONTEND_URL}/cart?status=error`);
   }
 });
 
 // --- INICIAR SERVIDOR ---
 app.listen(port, () => {
-  console.log(`\n🚀 Backend corriendo en: http://localhost:${port}`);
+  console.log(`\n🚀 Backend Seguro corriendo en: ${BACKEND_URL}`);
 });

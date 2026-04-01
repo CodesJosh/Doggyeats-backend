@@ -1,8 +1,9 @@
+import 'dotenv/config';
 import mongoose from 'mongoose';
 import { Product } from './models/Product.js';
 
-// Conexión a la Base de Datos
-mongoose.connect('mongodb://127.0.0.1:27017/doggyeats')
+// ✅ Usa la variable de entorno en lugar de URI hardcodeada
+mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/doggyeats')
   .then(() => console.log('🍃 MongoDB Conectado para Seed'))
   .catch(err => console.error(err));
 
@@ -13,7 +14,7 @@ const products = [
     category: "Perros",
     price: 24990,
     stock: 50,
-    image: "https://www.masterdog.cl/wp-content/uploads/2021/03/Master-Dog-Adulto-Carne-Arroz-15-kg-1.png", 
+    image: "https://www.masterdog.cl/wp-content/uploads/2021/03/Master-Dog-Adulto-Carne-Arroz-15-kg-1.png",
     description: "Alimento completo para perros adultos de todas las razas. Fórmula reforzada con proteínas de alta calidad."
   },
   {
@@ -21,7 +22,7 @@ const products = [
     category: "Perros",
     price: 18990,
     stock: 30,
-    image: "https://jumbocolombiafood.vteximg.com.br/arquivos/ids/3482522-1000-1000/7702084042852-1.jpg", 
+    image: "https://jumbocolombiafood.vteximg.com.br/arquivos/ids/3482522-1000-1000/7702084042852-1.jpg",
     description: "Crecimiento sano y fuerte para tu cachorro. Contiene calcio y leche para huesos fuertes."
   },
   {
@@ -40,7 +41,7 @@ const products = [
     image: "https://www.royalcanin.com/cl/dogs/products/retail-products/maxi-adult-dry/-/media/c6e3b8f5f6e84d0fa3e5f4a5f6e84d0f.jpg",
     description: "Alta gama para perros grandes. Ayuda a mantener un peso ideal y huesos saludables."
   },
-  
+
   // --- GATOS ---
   {
     name: "Whiskas Carne 10kg",
@@ -96,19 +97,15 @@ const products = [
 
 const seedDB = async () => {
   try {
-    // 1. Borrar todo lo anterior para no duplicar
     await Product.deleteMany({});
     console.log("🧹 Productos anteriores eliminados...");
 
-    // 2. Insertar los nuevos
     await Product.insertMany(products);
     console.log("✅ ¡Catálogo insertado correctamente!");
     console.log(`📦 Se agregaron ${products.length} productos.`);
-
   } catch (error) {
     console.error("❌ Error en el seed:", error);
   } finally {
-    // 3. Cerrar conexión
     mongoose.connection.close();
   }
 };
